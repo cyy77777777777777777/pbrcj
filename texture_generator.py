@@ -19,11 +19,25 @@ import sys
 import traceback
 from pathlib import Path
 
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+
 import numpy as np
 import cv2
 from PIL import Image
 import torch
 import gradio as gr
+
+# ---- 修复 gradio_client 4.x 在 Python 3.9 上的 additionalProperties bug ----
+try:
+    import gradio_client.utils as _gc_utils
+    _orig_json_schema_to_python_type = _gc_utils._json_schema_to_python_type
+    def _patched_json_schema_to_python_type(schema, defs):
+        if isinstance(schema, bool):
+            return "Any"
+        return _orig_json_schema_to_python_type(schema, defs)
+    _gc_utils._json_schema_to_python_type = _patched_json_schema_to_python_type
+except Exception:
+    pass
 
 # =====================================================================
 # 全局模型实例
@@ -36,12 +50,12 @@ _device = "cuda" if torch.cuda.is_available() else "cpu"
 
 MATERIAL_BASELINES = {
     "通用": {"normal_mul": 1.00, "roughness_offset": 0.00, "metallic_mul": 1.00},
-    "木头": {"normal_mul": 1.15, "roughness_offset": 0.18, "metallic_mul": 0.15},
-    "石头": {"normal_mul": 1.25, "roughness_offset": 0.22, "metallic_mul": 0.08},
-    "地面": {"normal_mul": 1.10, "roughness_offset": 0.12, "metallic_mul": 0.12},
-    "墙体": {"normal_mul": 1.05, "roughness_offset": 0.15, "metallic_mul": 0.10},
+    "木头": {"normal_mul": 1.30, "roughness_offset": 0.18, "metallic_mul": 0.15},
+    "石头": {"normal_mul": 1.60, "roughness_offset": 0.22, "metallic_mul": 0.08},
+    "地面": {"normal_mul": 1.50, "roughness_offset": 0.15, "metallic_mul": 0.12},
+    "墙体": {"normal_mul": 1.40, "roughness_offset": 0.18, "metallic_mul": 0.10},
     "有机物": {"normal_mul": 0.95, "roughness_offset": 0.08, "metallic_mul": 0.05},
-    "金属": {"normal_mul": 0.90, "roughness_offset": -0.12, "metallic_mul": 2.20},
+    "金属": {"normal_mul": 1.00, "roughness_offset": -0.12, "metallic_mul": 2.20},
 }
 
 
@@ -119,9 +133,9 @@ def apply_preset(mode: str):
             True,    # one_click_clarity
             True,    # reference_enhance
             True,    # use_ai_normals
-            2.5,     # normal_strength
+            4.0,     # normal_strength
             False,   # height_invert
-            0.55,    # roughness_bias
+            0.60,    # roughness_bias
             0.8,     # metallic_sensitivity
             "⚡ 已应用快速预设：Small模型 + 深度推算法线，适合先看结果。",
         )
@@ -132,9 +146,9 @@ def apply_preset(mode: str):
         True,    # one_click_clarity
         True,    # reference_enhance
         True,    # use_ai_normals
-        3.0,     # normal_strength
+        5.0,     # normal_strength
         False,   # height_invert
-        0.60,    # roughness_bias
+        0.65,    # roughness_bias
         1.0,     # metallic_sensitivity
         "🎯 已应用高质量预设：Large模型 + NormalBae，首次加载较慢但质量更高。",
     )
@@ -182,26 +196,26 @@ def enhance_height_with_albedo_detail(
     gray = cv2.cvtColor(color, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
 
     # 局部对比增强，让缝隙细节更明确
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     gray_eq = clahe.apply((gray * 255).astype(np.uint8)).astype(np.float32) / 255.0
 
-    # 高频细节和边缘特征
-    high = gray_eq - cv2.GaussianBlur(gray_eq, (0, 0), 2.0)
-    high = np.clip(high * 2.5, -1.0, 1.0)
-    edges = cv2.Laplacian(gray_eq, cv2.CV_32F, ksize=3)
-    edges = np.abs(edges)
-    edges = edges / (edges.max() + 1e-8)
-
+    # 砖面亮度直接作为高度的主要参考（亮=高，缝隙暗=低）
     if material_type in ["墙体", "石头", "地面"]:
-        depth_w, gray_w, high_w, edge_w = 0.56, 0.22, 0.26, 0.20
+        depth_w, gray_w = 0.35, 0.65
     elif material_type == "木头":
-        depth_w, gray_w, high_w, edge_w = 0.60, 0.22, 0.20, 0.12
+        depth_w, gray_w = 0.45, 0.55
     else:
-        depth_w, gray_w, high_w, edge_w = 0.66, 0.20, 0.15, 0.10
+        depth_w, gray_w = 0.55, 0.45
 
-    enhanced = depth * depth_w + gray_eq * gray_w + high * high_w + edges * edge_w
+    enhanced = depth * depth_w + gray_eq * gray_w
     enhanced = np.clip(enhanced, 0, 1)
-    enhanced = cv2.bilateralFilter(enhanced.astype(np.float32), 7, 0.08, 7)
+
+    # 对比度拉伸
+    p_low, p_high = np.percentile(enhanced, [1, 99])
+    if p_high > p_low:
+        enhanced = np.clip((enhanced - p_low) / (p_high - p_low), 0, 1)
+
+    enhanced = cv2.bilateralFilter(enhanced.astype(np.float32), 9, 0.10, 9)
     return np.clip(enhanced, 0, 1)
 
 
@@ -279,8 +293,11 @@ def generate_height(
     invert: bool,
     material_type: str,
     reference_enhance: bool,
-) -> np.ndarray:
-    """返回 float32 [0,1] 高度图（HxW）"""
+) -> tuple:
+    """返回 (height_clean, height_enhanced), 均为 float32 [0,1]
+    height_clean: 纯 AI 深度（干净，供法线图用）
+    height_enhanced: 融合颜色细节（供高度/AO/粗糙度用）
+    """
     if _depth_pipe is None:
         raise RuntimeError("深度模型未加载，请先点击\"加载模型\"。")
 
@@ -303,10 +320,32 @@ def generate_height(
     h, w = np.array(pil_img).shape[:2]
     depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_CUBIC)
 
-    if reference_enhance:
-        depth = enhance_height_with_albedo_detail(pil_img, depth, material_type)
+    # depth_clean: 原始 AI 深度（供法线用，Sobel 自然忽略全局渐变）
+    depth_clean = depth.copy()
+    if invert:
+        depth_clean = 1.0 - depth_clean
 
-    return (1.0 - depth) if invert else depth
+    # 增强版：去除全局渐变 + 融合颜色细节（供高度/AO/粗糙度用）
+    blur_radius = max(h, w) // 4
+    if blur_radius % 2 == 0:
+        blur_radius += 1
+    blur_radius = max(blur_radius, 31)
+    global_trend = cv2.GaussianBlur(depth, (blur_radius, blur_radius), blur_radius / 3.0)
+    depth_local = depth - global_trend
+    dl_min, dl_max = depth_local.min(), depth_local.max()
+    if dl_max > dl_min:
+        height_for_enhance = (depth_local - dl_min) / (dl_max - dl_min)
+    else:
+        height_for_enhance = np.zeros_like(depth_local)
+    if invert:
+        height_for_enhance = 1.0 - height_for_enhance
+
+    if reference_enhance:
+        height_enhanced = enhance_height_with_albedo_detail(pil_img, height_for_enhance, material_type)
+    else:
+        height_enhanced = height_for_enhance
+
+    return depth_clean, height_enhanced
 
 
 # =====================================================================
@@ -315,13 +354,18 @@ def generate_height(
 def generate_normal_from_height(height: np.ndarray, strength: float) -> np.ndarray:
     """由高度图计算法线图，返回 uint8 HxWx3 (OpenGL 切线空间)"""
     h32 = height.astype(np.float32)
-    # 多尺度梯度混合，兼顾大形态和细节
-    gx3 = cv2.Sobel(h32, cv2.CV_32F, 1, 0, ksize=3)
-    gy3 = cv2.Sobel(h32, cv2.CV_32F, 0, 1, ksize=3)
-    gx5 = cv2.Sobel(h32, cv2.CV_32F, 1, 0, ksize=5)
-    gy5 = cv2.Sobel(h32, cv2.CV_32F, 0, 1, ksize=5)
-    gx = (gx5 * 0.65 + gx3 * 0.35) * strength
-    gy = (gy5 * 0.65 + gy3 * 0.35) * strength
+
+    # 模糊去噪（sigma=3.5，柔化缝隙过渡，减少缝隙阴影）
+    h32 = cv2.GaussianBlur(h32, (0, 0), 1.5)
+
+    # Sobel 5 求梯度（Sobel 是高通滤波，自然忽略全局渐变）
+    gx = cv2.Sobel(h32, cv2.CV_32F, 1, 0, ksize=5) * strength
+    gy = cv2.Sobel(h32, cv2.CV_32F, 0, 1, ksize=5) * strength
+
+    # 软压缩极端梯度，缝隙处法线偏转不超过阈值
+    limit = 1.5
+    gx = limit * np.tanh(gx / limit)
+    gy = limit * np.tanh(gy / limit)
 
     nx = -gx
     ny =  gy   # OpenGL Y-up
@@ -371,12 +415,19 @@ def generate_roughness(color: np.ndarray, height: np.ndarray, bias: float) -> np
     variance = np.sqrt(np.clip(mean_sq - sq_mean, 0, None))
     variance = np.clip(variance / (variance.max() + 1e-8), 0, 1)
 
+    # 高度图梯度 → 缝隙/边缘位置更粗糙
+    h_grad_x = cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3)
+    h_grad_y = cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3)
+    h_edge = np.sqrt(h_grad_x ** 2 + h_grad_y ** 2)
+    h_edge = np.clip(h_edge / (h_edge.max() + 1e-8), 0, 1)
+
     roughness = (
-        0.32 * freq +
-        0.25 * variance +
-        0.20 * (1.0 - val) +     # 暗区偏粗糙
-        0.10 * (1.0 - sat) +     # 低饱和偏粗糙
-        0.08 * (1.0 - height) +  # 凹陷处偏粗糙
+        0.34 * freq +
+        0.22 * variance +
+        0.18 * (1.0 - val) +     # 暗区偏粗糙
+        0.08 * (1.0 - sat) +     # 低饱和偏粗糙
+        0.10 * (1.0 - height) +  # 凹陷处偏粗糙
+        0.06 * h_edge +           # 缝隙边缘偏粗糙
         0.05                     # 基础偏移
     )
     roughness = np.clip(roughness + bias, 0, 1)
@@ -394,8 +445,8 @@ def generate_metallic(color: np.ndarray, sensitivity: float) -> np.ndarray:
     sat = hsv[:, :, 1] / 255.0
     val = hsv[:, :, 2] / 255.0
 
-    # 消色差金属 (钢/铝/铬): 低饱和 + 中高亮度
-    gray_metal = np.power(np.maximum(0, 1.0 - sat * 2.0), 2) * val
+    # 消色差金属 (钢/铝/铬): 低饱和 + 高亮度（提高阈值避免非金属材质误检）
+    gray_metal = np.power(np.maximum(0, 1.0 - sat * 2.5), 3) * np.power(np.maximum(0, val - 0.4), 2)
 
     # 黄金: H ≈ 18-38°
     gold = np.where(
@@ -408,7 +459,9 @@ def generate_metallic(color: np.ndarray, sensitivity: float) -> np.ndarray:
         np.minimum(sat * 1.2, 1.0) * np.minimum(val * 1.1, 1.0) * 0.75, 0.0
     )
 
-    metallic = np.clip((gray_metal * 0.55 + gold + copper) * sensitivity, 0, 1)
+    metallic = np.clip((gray_metal * 0.40 + gold + copper) * sensitivity, 0, 1)
+    # 强力抑制低值噪声，非金属材质应接近纯黑
+    metallic = np.where(metallic < 0.15, 0.0, metallic)
     metallic = cv2.GaussianBlur(metallic.astype(np.float32), (11, 11), 3.0)
     return np.clip(metallic, 0, 1)
 
@@ -418,22 +471,27 @@ def generate_metallic(color: np.ndarray, sensitivity: float) -> np.ndarray:
 # =====================================================================
 def generate_ao(height: np.ndarray) -> np.ndarray:
     """返回 float32 [0,1] AO 图"""
-    ao = np.ones(height.shape, dtype=np.float32)
+    h = height.astype(np.float32)
+    # 先对高度做模糊，去除砖面微噪，只保留缝隙级别的高度变化
+    h = cv2.GaussianBlur(h, (0, 0), 2.0)
 
-    for radius, weight in [(5, 0.12), (11, 0.15), (23, 0.18), (47, 0.20), (95, 0.15)]:
+    ao = np.ones(h.shape, dtype=np.float32)
+
+    for radius, weight in [(3, 0.10), (7, 0.15), (15, 0.20), (31, 0.22), (63, 0.15)]:
         k = radius * 2 + 1
-        local_mean = cv2.GaussianBlur(height.astype(np.float32), (k, k), radius / 3.0)
-        shadow = np.clip((local_mean - height) * 2.5, 0, 1)
+        local_mean = cv2.GaussianBlur(h, (k, k), radius / 3.0)
+        shadow = np.clip((local_mean - h) * 2.5, 0, 1)
         ao -= shadow * weight
 
-    # 利用曲率增强缝隙遮蔽，提升砖缝层次
-    lap = cv2.Laplacian(height.astype(np.float32), cv2.CV_32F, ksize=3)
+    # 曲率检测缝隙遮蔽（降低倍数避免噪点）
+    lap = cv2.Laplacian(h, cv2.CV_32F, ksize=5)
     crevice = np.clip(-lap * 2.0, 0, 1)
-    ao -= crevice * 0.12
+    ao -= crevice * 0.15
 
     ao = np.clip(ao, 0, 1)
-    ao = np.power(ao, 1.35)   # 增强对比度
-    ao = cv2.bilateralFilter(ao.astype(np.float32), 7, 0.06, 7)
+    ao = np.power(ao, 1.2)   # 轻微增强对比度
+    # 较强的双边滤波清除残余噪点
+    ao = cv2.bilateralFilter(ao, 9, 0.08, 9)
     return np.clip(ao, 0, 1)
 
 
@@ -498,16 +556,22 @@ def process(
 
         # 1. 高度图 (AI)
         progress(0.05, desc="[1/6] AI 深度估计 → 高度图 ...")
-        height = generate_height(pil_img, height_invert, material_type, reference_enhance)
+        height_clean, height = generate_height(pil_img, height_invert, material_type, reference_enhance)
 
-        # 2. 法线图
+        # 2. 法线图（从干净的 AI 深度图计算，不含颜色纹理）
         progress(0.25, desc="[2/6] 生成法线图 ...")
+        normal_from_height = generate_normal_from_height(height_clean, tuned_normal_strength)
         if use_ai_normals and _normal_detector is not None:
-            normal = generate_normal_ai(pil_img)
+            normal_ai = generate_normal_ai(pil_img)
+            # 对齐尺寸后混合 AI 法线(全局准确) 和 高度推算法线(边缘锐利)
+            h_h, w_h = normal_from_height.shape[:2]
+            if normal_ai.shape[:2] != (h_h, w_h):
+                normal_ai = cv2.resize(normal_ai, (w_h, h_h), interpolation=cv2.INTER_CUBIC)
+            normal = (normal_ai.astype(np.float32) * 0.5 + normal_from_height.astype(np.float32) * 0.5).astype(np.uint8)
         else:
             if use_ai_normals and _normal_detector is None:
                 gr.Warning("NormalBae 未加载，改用高度深度推算法线")
-            normal = generate_normal_from_height(height, tuned_normal_strength)
+            normal = normal_from_height
 
         # 3. 粗糙度
         progress(0.45, desc="[3/6] 生成粗糙度 ...")
@@ -528,7 +592,7 @@ def process(
         # 一键清晰增强（去模糊）
         if one_click_clarity:
             progress(0.95, desc="清晰增强处理中 ...")
-            normal_u8 = enhance_clarity(normal, amount=0.9, sigma=0.9)
+            normal_u8 = normal  # 法线图不做锐化，避免放大噪声
             height_u8 = enhance_clarity((height * 255).astype(np.uint8), amount=1.1, sigma=0.9)
             rough_u8 = enhance_clarity((roughness * 255).astype(np.uint8), amount=1.0, sigma=1.0)
             metal_u8 = enhance_clarity((metallic * 255).astype(np.uint8), amount=0.8, sigma=1.0)
@@ -586,6 +650,148 @@ def process(
 # =====================================================================
 # Gradio 界面
 # =====================================================================
+_block_css = """
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
+
+:root {
+    --bg-a: #f5f7ee;
+    --bg-b: #e8efe0;
+    --ink: #162218;
+    --muted: #4f5d4f;
+    --brand: #2d8f52;
+    --brand-2: #1f6f6c;
+    --card: rgba(255, 255, 255, 0.74);
+    --stroke: rgba(34, 67, 43, 0.18);
+}
+
+.gradio-container {
+    font-family: 'Space Grotesk', 'Noto Sans SC', sans-serif !important;
+    color: var(--ink) !important;
+    background:
+        radial-gradient(1200px 420px at 10% -20%, #f6f0dc 20%, transparent 60%),
+        radial-gradient(950px 360px at 100% -10%, #dfeee4 15%, transparent 58%),
+        linear-gradient(160deg, var(--bg-a), var(--bg-b));
+}
+
+.hero-wrap {
+    background: linear-gradient(120deg, rgba(255,255,255,0.65), rgba(232,246,235,0.72));
+    border: 1px solid var(--stroke);
+    border-radius: 18px;
+    padding: 16px 18px 10px;
+    margin-bottom: 10px;
+    box-shadow: 0 10px 30px rgba(24, 44, 28, 0.08);
+}
+
+.hero-kicker {
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    color: var(--brand-2);
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+
+.hero-title {
+    margin: 0;
+    font-size: 34px;
+    line-height: 1.1;
+    color: #19301f;
+}
+
+.hero-sub {
+    margin: 8px 0 4px;
+    color: var(--muted);
+    font-size: 15px;
+}
+
+.panel {
+    background: var(--card);
+    border: 1px solid var(--stroke);
+    border-radius: 18px;
+    padding: 12px;
+    backdrop-filter: blur(4px);
+    box-shadow: 0 8px 20px rgba(24, 44, 28, 0.06);
+}
+
+.left-panel .gr-accordion {
+    margin-bottom: 8px !important;
+}
+
+.left-panel .gr-tabs {
+    margin-top: 2px !important;
+}
+
+.left-panel .gr-tab-nav {
+    margin-bottom: 6px !important;
+}
+
+.left-panel .gr-form,
+.left-panel .gr-box,
+.left-panel .gr-block {
+    gap: 8px !important;
+}
+
+.left-panel .gr-slider,
+.left-panel .gr-checkbox,
+.left-panel .gr-dropdown,
+.left-panel .gr-textbox {
+    margin-bottom: 6px !important;
+}
+
+.right-panel {
+    min-height: auto;
+}
+
+.right-panel .gr-accordion {
+    margin-top: 8px !important;
+}
+
+.output-img img {
+    image-rendering: auto;
+    border-radius: 12px;
+    border: 1px solid rgba(26, 55, 36, 0.15);
+    cursor: zoom-in;
+}
+
+.img-zoom-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(8, 14, 10, 0.86);
+    backdrop-filter: blur(4px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 99999;
+    flex-direction: column;
+    padding: 18px;
+}
+
+.img-zoom-overlay.open {
+    display: flex;
+}
+
+.img-zoom-target {
+    max-width: min(92vw, 1600px);
+    max-height: 86vh;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.26);
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.img-zoom-hint {
+    margin-top: 10px;
+    color: rgba(236, 248, 238, 0.9);
+    font-size: 13px;
+    letter-spacing: 0.02em;
+}
+
+button.primary {
+    background: linear-gradient(135deg, var(--brand), #3aa464) !important;
+    border: 0 !important;
+}
+
+footer { display: none !important; }
+"""
+
 def build_ui():
     global _zoom_js
     zoom_js = """
@@ -632,7 +838,7 @@ def build_ui():
 
     if True:
 
-        with gr.Blocks(title="AI PBR 贴图生成器") as demo:
+        with gr.Blocks(title="AI PBR 贴图生成器", theme=gr.themes.Soft(), js=_zoom_js, css=_block_css) as demo:
 
             gr.Markdown(
                 """
@@ -708,11 +914,11 @@ def build_ui():
                                     )
                             with gr.Tab("高级"):
                                 normal_strength = gr.Slider(
-                                    0.5, 10.0, value=3.0, step=0.5,
+                                    0.5, 15.0, value=4.0, step=0.5,
                                     label="法线强度",
                                 )
                                 roughness_bias = gr.Slider(
-                                    0.0, 1.0, value=0.55, step=0.05,
+                                    0.0, 1.0, value=0.60, step=0.05,
                                     label="粗糙度偏移",
                                 )
                                 metallic_sensitivity = gr.Slider(
@@ -849,147 +1055,4 @@ if __name__ == "__main__":
         server_port=7860,
         inbrowser=True,
         share=False,
-        theme=gr.themes.Soft(),
-        js=_zoom_js,
-        css="""
-                @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
-
-                :root {
-                    --bg-a: #f5f7ee;
-                    --bg-b: #e8efe0;
-                    --ink: #162218;
-                    --muted: #4f5d4f;
-                    --brand: #2d8f52;
-                    --brand-2: #1f6f6c;
-                    --card: rgba(255, 255, 255, 0.74);
-                    --stroke: rgba(34, 67, 43, 0.18);
-                }
-
-                .gradio-container {
-                    font-family: 'Space Grotesk', 'Noto Sans SC', sans-serif !important;
-                    color: var(--ink) !important;
-                    background:
-                        radial-gradient(1200px 420px at 10% -20%, #f6f0dc 20%, transparent 60%),
-                        radial-gradient(950px 360px at 100% -10%, #dfeee4 15%, transparent 58%),
-                        linear-gradient(160deg, var(--bg-a), var(--bg-b));
-                }
-
-                .hero-wrap {
-                    background: linear-gradient(120deg, rgba(255,255,255,0.65), rgba(232,246,235,0.72));
-                    border: 1px solid var(--stroke);
-                    border-radius: 18px;
-                    padding: 16px 18px 10px;
-                    margin-bottom: 10px;
-                    box-shadow: 0 10px 30px rgba(24, 44, 28, 0.08);
-                }
-
-                .hero-kicker {
-                    font-size: 12px;
-                    letter-spacing: 0.14em;
-                    color: var(--brand-2);
-                    font-weight: 700;
-                    margin-bottom: 6px;
-                }
-
-                .hero-title {
-                    margin: 0;
-                    font-size: 34px;
-                    line-height: 1.1;
-                    color: #19301f;
-                }
-
-                .hero-sub {
-                    margin: 8px 0 4px;
-                    color: var(--muted);
-                    font-size: 15px;
-                }
-
-                .panel {
-                    background: var(--card);
-                    border: 1px solid var(--stroke);
-                    border-radius: 18px;
-                    padding: 12px;
-                    backdrop-filter: blur(4px);
-                    box-shadow: 0 8px 20px rgba(24, 44, 28, 0.06);
-                }
-
-                .left-panel .gr-accordion {
-                    margin-bottom: 8px !important;
-                }
-
-                .left-panel .gr-tabs {
-                    margin-top: 2px !important;
-                }
-
-                .left-panel .gr-tab-nav {
-                    margin-bottom: 6px !important;
-                }
-
-                .left-panel .gr-form,
-                .left-panel .gr-box,
-                .left-panel .gr-block {
-                    gap: 8px !important;
-                }
-
-                .left-panel .gr-slider,
-                .left-panel .gr-checkbox,
-                .left-panel .gr-dropdown,
-                .left-panel .gr-textbox {
-                    margin-bottom: 6px !important;
-                }
-
-                .right-panel {
-                    min-height: auto;
-                }
-
-                .right-panel .gr-accordion {
-                    margin-top: 8px !important;
-                }
-
-                .output-img img {
-                    image-rendering: auto;
-                    border-radius: 12px;
-                    border: 1px solid rgba(26, 55, 36, 0.15);
-                    cursor: zoom-in;
-                }
-
-                .img-zoom-overlay {
-                    position: fixed;
-                    inset: 0;
-                    background: rgba(8, 14, 10, 0.86);
-                    backdrop-filter: blur(4px);
-                    display: none;
-                    align-items: center;
-                    justify-content: center;
-                    z-index: 99999;
-                    flex-direction: column;
-                    padding: 18px;
-                }
-
-                .img-zoom-overlay.open {
-                    display: flex;
-                }
-
-                .img-zoom-target {
-                    max-width: min(92vw, 1600px);
-                    max-height: 86vh;
-                    border-radius: 12px;
-                    border: 1px solid rgba(255, 255, 255, 0.26);
-                    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
-                }
-
-                .img-zoom-hint {
-                    margin-top: 10px;
-                    color: rgba(236, 248, 238, 0.9);
-                    font-size: 13px;
-                    letter-spacing: 0.02em;
-                }
-
-                button.primary {
-                    background: linear-gradient(135deg, var(--brand), #3aa464) !important;
-                    border: 0 !important;
-                }
-
-                footer { display: none !important; }
-        """,
     )
