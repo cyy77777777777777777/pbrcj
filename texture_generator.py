@@ -658,7 +658,7 @@ _block_css = """
     --bg-b: #e8efe0;
     --ink: #162218;
     --muted: #4f5d4f;
-    --brand: #2d8f52;
+            server_port=None,
     --brand-2: #1f6f6c;
     --card: rgba(255, 255, 255, 0.74);
     --stroke: rgba(34, 67, 43, 0.18);
@@ -1052,7 +1052,7 @@ if __name__ == "__main__":
     demo = build_ui()
     demo.launch(
         server_name="127.0.0.1",
-        server_port=7860,
+        server_port=None,
         inbrowser=True,
         share=False,
     )
